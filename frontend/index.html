@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>KVStore Frontend Tester</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    :root{--bg:#fff;--text:#0b1020;--muted:#6b7280;--card:#f8fafc;--bd:#e5e7eb;}
+    body{font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; margin:24px; color:var(--text); background:var(--bg);}
+    h1{margin:0 0 8px 0;}
+    h3{margin:0 0 8px 0;}
+    .card{border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:16px; background:var(--card);}
+    input,select,button,textarea{padding:8px; margin:4px 6px 8px 0; border-radius:8px; border:1px solid #cbd5e1;}
+    button{cursor:pointer}
+    .muted{color:var(--muted); font-size:12px;}
+    pre{background:#0b1020; color:#d7e3ff; padding:12px; border-radius:10px; overflow:auto; max-height:45vh;}
+    .row{display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
+
+    .grid{ display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:12px; align-items:stretch; }
+    .node{ height:100%; display:flex; flex-direction:column; background:#fff; border:1px solid var(--bd); border-radius:12px; padding:12px; }
+
+    .url{ font-weight:600; word-break:break-all; display:flex; align-items:center; gap:8px; }
+    .dot{display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle; background:#a1a1aa;}
+    .ok{background:#16a34a !important}
+    .err{background:#dc2626 !important}
+    .tag{display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--bd); font-size:12px; margin-left:6px;}
+    .small{font-size:12px}
+
+    .tag.role{font-weight:700}
+    .tag.role.leader{background:#fef3c7;border-color:#f59e0b;color:#92400e}
+    .tag.role.follower{background:#dbeafe;border-color:#60a5fa;color:#1e40af}
+
+    @media (max-width: 1100px){
+      :root{ font-size: 14px; }
+      .node{ padding:10px; }
+      input,select,button,textarea{ padding:6px; }
+      .tag{ font-size:11px; }
+    }
+    @media (max-width: 800px){
+      :root{ font-size: 13px; }
+      .node{ padding:8px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>KVStore Frontend Tester</h1>
+  <div class="muted">Share this page, click <b>Probe /health</b>, then use Ops. Writes auto-target the current leader.</div>
+
+  <!-- Cluster Control (via supervisor :9000) -->
+  <div class="card">
+    <h3>Cluster Control</h3>
+    <div class="row">
+      <label>Supervisor</label>
+      <input id="supUrl" size="28" value="http://localhost:9000"/>
+      <label>Token</label>
+      <input id="supToken" size="18" placeholder="x-demo-token"/>
+      <button id="startCluster">Start 3-node</button>
+      <button id="stopCluster">Stop all</button>
+      <button id="statusBtn">Status</button>
+      <button id="restartL">Restart n1</button>
+      <button id="restartF1">Restart n2</button>
+      <button id="restartF2">Restart n3</button>
+      <button id="copyShare">Copy share link</button>
+    </div>
+    <div class="muted">Mutating supervisor actions require header <code>x-demo-token</code> (set above). Status is open.</div>
+  </div>
+
+  <div class="card">
+    <h3>Cluster Nodes</h3>
+    <div>Enter comma-separated base URLs (no trailing slash):</div>
+    <textarea id="nodesText" rows="2" style="width:100%">http://localhost:8080, http://localhost:8081, http://localhost:8082</textarea><br/>
+    <div class="row">
+      <button id="saveNodes">Save Nodes</button>
+      <button id="probe">Probe /health</button>
+      <label class="row small"><input type="checkbox" id="autoProbe" /> Auto refresh health</label>
+      <span class="muted">Writes automatically go to the node that reports <b>is_leader=true</b>.</span>
+    </div>
+
+    <div id="nodeGrid" class="grid"></div>
+
+    <div class="row" style="margin-top:8px">
+      <label for="readNode">Read from node:</label>
+      <select id="readNode"></select>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Operations</h3>
+    <div class="row">
+      <label>Key</label><input id="key" placeholder="e.g., user:42" size="24"/>
+      <label>Value</label><input id="value" placeholder="e.g., alice" size="24"/>
+    </div>
+    <div class="row">
+      <button id="putBtn">PUT (auto-leader)</button>
+      <button id="getBtn">GET (selected node)</button>
+      <button id="getQuorumBtn">GET (quorum: 2 nodes)</button>
+      <button id="delBtn">DELETE (auto-leader)</button>
+    </div>
+    <div class="muted" id="leaderHint">Using leader: (detecting...)</div>
+    <div class="muted">Quorum GET reads two nodes and returns highest version.</div>
+  </div>
+
+  <div class="card">
+    <h3>Output</h3>
+    <pre id="log"></pre>
+  </div>
+
+<script>
+  // --- Defaults for localhost (override via query params below) ---
+  (function initDefaults(){
+    const proto = window.location.protocol;  // 'http:' or 'https:'
+    const host  = window.location.hostname;  // 'localhost' or public host
+    const nodesTextEl = document.getElementById('nodesText');
+    const supEl = document.getElementById('supUrl');
+    if (host === 'localhost' || host === '127.0.0.1') {
+      nodesTextEl.value = `${proto}//${host}:8080, ${proto}//${host}:8081, ${proto}//${host}:8082`;
+      supEl.value = `${proto}//${host}:9000`;
+    }
+  })();
+  // --- Prefill from URL: ?sup=...&nodes=a,b,c OR &n1=...&n2=...&n3=... ---
+  (function fromQuery(){
+    const q = new URLSearchParams(location.search);
+    const sup = q.get('sup');
+    const nodesCSV = q.get('nodes');
+    const n1 = q.get('n1'), n2 = q.get('n2'), n3 = q.get('n3');
+    if (sup) document.getElementById('supUrl').value = sup;
+    const nodes = nodesCSV ? nodesCSV : [n1,n2,n3].filter(Boolean).join(', ');
+    if (nodes) document.getElementById('nodesText').value = nodes;
+  })();
+  // --- Prefill token from URL: ?token=... ---
+  (function tokenFromQuery(){
+    const q = new URLSearchParams(location.search);
+    const t = q.get('token');
+    if (t) document.getElementById('supToken').value = t;
+  })();
+
+  const nodesSel = document.getElementById('readNode');
+  const nodesText = document.getElementById('nodesText');
+  const nodeGrid  = document.getElementById('nodeGrid');
+  const logEl = document.getElementById('log');
+  const autoProbeCb = document.getElementById('autoProbe');
+
+  let nodes = [];
+  let roles = [];   // true (leader), false (follower), null (unknown)
+  let probeTimer = null;
+
+  // ---------- Logging ----------
+  function log(line, obj) {
+    const ts = new Date().toISOString();
+    let str = `[${ts}] ${line}`;
+    if (obj !== undefined) str += `\n${JSON.stringify(obj, null, 2)}`;
+    logEl.textContent = str + "\n\n" + logEl.textContent;
+  }
+
+  // ---------- Role UI ----------
+  function setRole(i, isLeader){
+    const el = document.getElementById(`role-${i}`);
+    roles[i] = (isLeader === true) ? true : (isLeader === false ? false : null);
+    if (!el) return;
+    el.classList.remove('leader','follower');
+    if (isLeader === true){
+      el.textContent = 'role: LEADER';
+      el.classList.add('leader');
+    } else if (isLeader === false){
+      el.textContent = 'role: FOLLOWER';
+      el.classList.add('follower');
+    } else {
+      el.textContent = 'role: ?';
+    }
+    refreshReadDropdownLabels();
+    updateLeaderHint();
+  }
+
+  function leaderBase(){
+    const leaders = nodes.map((n,i)=>({n,i})).filter(({i})=>roles[i]===true);
+    if (leaders.length >= 1) return leaders[0].n;
+    return nodes[0] || null; // fallback while detecting
+  }
+
+  function refreshReadDropdownLabels(){
+    Array.from(nodesSel.options).forEach((opt, i) => {
+      const prefix = (roles[i]===true) ? "(leader) " : "";
+      opt.textContent = `${prefix}${nodes[i]}`;
+    });
+  }
+
+  function updateLeaderHint(){
+    const base = leaderBase();
+    const known = roles.some(r => r === true);
+    const multi = roles.filter(r => r === true).length > 1;
+
+    let text = known ? `Using leader: ${base}` : `Using leader: (unknown yet) → defaulting to ${base}`;
+    if (multi) text += " — warning: multiple leaders reported";
+    const el = document.getElementById('leaderHint');
+    if (el) el.textContent = text;
+  }
+
+  // ---------- Node list / grid ----------
+  function saveNodes() {
+    nodes = nodesText.value.split(",").map(s => s.trim()).filter(Boolean);
+    roles = new Array(nodes.length).fill(null);
+    nodesSel.innerHTML = "";
+    nodes.forEach((n,i) => {
+      const o = document.createElement('option');
+      o.value = n; o.textContent = n;
+      nodesSel.appendChild(o);
+    });
+    renderGrid();
+    updateLeaderHint();
+    log(`Saved ${nodes.length} node(s): ${nodes.join(", ")}`);
+  }
+
+  function renderGrid() {
+    nodeGrid.innerHTML = "";
+    nodes.forEach((n,i) => {
+      const card = document.createElement('div');
+      card.className = 'node';
+      card.id = `node-${i}`;
+      card.innerHTML = `
+        <div class="url"><span id="dot-${i}" class="dot"></span>${n}
+          <span id="role-${i}" class="tag role">role: ?</span>
+        </div>
+        <div class="small muted" id="state-${i}">checking...</div>
+        <div class="row" style="margin-top:8px">
+          <button data-i="${i}" class="btn-inspect">Inspect</button>
+          <label class="tag"><input type="checkbox" data-i="${i}" id="downchk-${i}" class="sw-down"> Down</label>
+          <label class="tag"><input type="checkbox" data-i="${i}" id="blkchk-${i}"  class="sw-blk"> Block repl</label>
+        </div>
+      `;
+      nodeGrid.appendChild(card);
+    });
+    nodeGrid.querySelectorAll('.btn-inspect').forEach(b=>b.onclick = () => inspectOne(+b.dataset.i));
+    nodeGrid.querySelectorAll('.sw-down').forEach(ch=>ch.onchange = () => toggleOne(+ch.dataset.i,{down: ch.checked}));
+    nodeGrid.querySelectorAll('.sw-blk').forEach(ch=>ch.onchange  = () => toggleOne(+ch.dataset.i,{block_repl: ch.checked}));
+  }
+
+  // ---------- HTTP ----------
+  async function doFetch(url, opts) {
+    const t0 = performance.now();
+    try {
+      const res = await fetch(url, opts);
+      const latency = (performance.now() - t0).toFixed(1);
+      let body;
+      try { body = await res.json(); } catch { body = await res.text(); }
+      return { ok: res.ok, status: res.status, latency, body };
+    } catch (e) {
+      return { ok: false, status: 0, latency: 0, body: String(e) };
+    }
+  }
+
+  // ---------- Node actions ----------
+  async function probeOne(i){
+    const n = nodes[i]; if (!n) return;
+    const r = await doFetch(`${n}/health`);
+    const dot = document.getElementById(`dot-${i}`);
+    const state = document.getElementById(`state-${i}`);
+    dot.classList.remove('ok','err');
+    dot.classList.add(r.ok && r.body?.ok ? 'ok' : 'err');
+    state.textContent = `GET /health → ${r.ok ? "✅" : "❌"} ${r.status} (${r.latency} ms)` + (r.body ? ` | ${JSON.stringify(r.body)}` : "");
+    log(`GET ${n}/health → ${r.ok ? "✅" : "❌"} ${r.status} (${r.latency} ms)`, r.body);
+    await configOne(i, true);
+  }
+
+  async function configOne(i, quiet=false){
+    const n = nodes[i]; if (!n) return;
+    const r = await doFetch(`${n}/admin/config`);
+    if (r.ok && r.body){
+      setRole(i, !!r.body.is_leader);
+      if (r.body.state){
+        const downEl = document.getElementById(`downchk-${i}`);
+        const blkEl  = document.getElementById(`blkchk-${i}`);
+        if (downEl) downEl.checked = !!r.body.state.down;
+        if (blkEl)  blkEl.checked  = !!r.body.state.block_repl;
+      }
+    } else {
+      setRole(i, null);
+    }
+    if (!quiet) log(`GET ${n}/admin/config → ${r.ok ? "✅" : "❌"} ${r.status} (${r.latency} ms)`, r.body);
+  }
+
+  async function inspectOne(i){
+    const n = nodes[i]; if (!n) return;
+    await probeOne(i);
+    const m = await doFetch(`${n}/metrics`);
+    log(`GET ${n}/metrics → ${m.ok ? "✅" : "❌"} ${m.status} (${m.latency} ms)`, m.body);
+  }
+
+  async function toggleOne(i, payload){
+    const n = nodes[i]; if (!n) return;
+    const r = await doFetch(`${n}/admin/toggle`, {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    log(`POST ${n}/admin/toggle ${JSON.stringify(payload)} → ${r.ok ? "✅" : "❌"} ${r.status} (${r.latency} ms)`, r.body);
+    probeOne(i);
+  }
+
+  // ---------- Ops (auto-select leader) ----------
+  document.getElementById('putBtn').onclick = async () => {
+    const base = leaderBase();
+    const key = document.getElementById('key').value.trim();
+    const value = document.getElementById('value').value;
+    if (!base || !key) return log("Need a detected leader and a key.");
+    const r = await doFetch(`${base}/kv/${encodeURIComponent(key)}`, {
+      method: 'PUT', headers: {'content-type':'application/json'}, body: JSON.stringify({ value })
+    });
+    log(`PUT (leader ${base}) /kv/${key} → ${r.ok ? "✅" : "❌"} ${r.status} (${r.latency} ms)`, r.body);
+  };
+
+  document.getElementById('delBtn').onclick = async () => {
+    const base = leaderBase();
+    const key = document.getElementById('key').value.trim();
+    if (!base || !key) return log("Need a detected leader and a key.");
+    const r = await doFetch(`${base}/kv/${encodeURIComponent(key)}`, { method: 'DELETE' });
+    log(`DELETE (leader ${base}) /kv/${key} → ${r.ok ? "✅" : "❌"} ${r.status} (${r.latency} ms)`, r.body);
+  };
+
+  document.getElementById('getBtn').onclick = async () => {
+    const base = nodesSel.value;
+    const key = document.getElementById('key').value.trim();
+    if (!base || !key) return log("Need node and key.");
+    const r = await doFetch(`${base}/kv/${encodeURIComponent(key)}`);
+    log(`GET ${base}/kv/${key} → ${r.ok ? "✅" : "❌"} ${r.status} (${r.latency} ms)`, r.body);
+  };
+
+  document.getElementById('getQuorumBtn').onclick = async () => {
+    const key = document.getElementById('key').value.trim();
+    if (nodes.length < 2) return log("Need at least 2 nodes for quorum GET.");
+    const bases = nodes.slice(0,2);
+    const [r1, r2] = await Promise.all(bases.map(b => doFetch(`${b}/kv/${encodeURIComponent(key)}`)));
+    const picks = [r1, r2].filter(r => r.ok);
+    if (picks.length === 0) return log(`Quorum GET: both 404/failed for key "${key}"`, { r1, r2 });
+    const best = picks.reduce((a,b) => ( (a.body?.version||0) >= (b.body?.version||0) ? a : b ));
+    log(`Quorum GET from ${bases.join(", ")} → chose highest version`, { r1, r2, chosen: best });
+  };
+
+  // ---------- Supervisor helpers (with token) ----------
+  function sup() { return document.getElementById('supUrl').value.trim(); }
+  function supTok() { return document.getElementById('supToken').value.trim(); }
+
+  async function supFetch(path, method='POST', body=null) {
+    const url = `${sup()}${path}`;
+    const t0 = performance.now();
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: {
+          'x-demo-token': supTok() || '',
+          ...(body ? {'content-type': 'application/json'} : {})
+        },
+        body: body ? JSON.stringify(body) : null
+      });
+      const ms = (performance.now() - t0).toFixed(1);
+      const data = await res.json().catch(() => ({}));
+      log(`${method} ${url} → ${res.ok ? "✅" : "❌"} ${res.status} (${ms} ms)`, data);
+      return { ok: res.ok, data };
+    } catch (e) {
+      log(`${method} ${url} failed`, String(e));
+      return { ok: false, data: null };
+    }
+  }
+
+  // ---------- Supervisor controls ----------
+  document.getElementById('startCluster').onclick = async () => {
+    const r = await supFetch('/cluster/start-default');
+    if (r.ok && r.data?.nodes) {
+      const urls = r.data.nodes.map(n => n.url).join(', ');
+      document.getElementById('nodesText').value = urls;
+      document.getElementById('saveNodes').click();
+      document.getElementById('probe').click();
+    }
+  };
+  document.getElementById('stopCluster').onclick = () => supFetch('/cluster/stop-all');
+  document.getElementById('statusBtn').onclick   = async () => {
+    const r = await supFetch('/cluster/status','GET');
+    if (r.ok && r.data?.nodes){
+      r.data.nodes.forEach((n,i)=>{
+        const dot = document.getElementById(`dot-${i}`);
+        if (dot){
+          dot.classList.remove('ok','err');
+          dot.classList.add(n.running && n.health?.ok ? 'ok' : 'err');
+        }
+        setRole(i, n.is_leader);
+      });
+      updateLeaderHint();
+    }
+  };
+  document.getElementById('restartL').onclick    = () => supFetch('/node/n1/restart');
+  document.getElementById('restartF1').onclick   = () => supFetch('/node/n2/restart');
+  document.getElementById('restartF2').onclick   = () => supFetch('/node/n3/restart');
+
+  // share link
+  document.getElementById('copyShare').onclick = async () => {
+    const supUrl = document.getElementById('supUrl').value.trim();
+    const nodes = document.getElementById('nodesText').value.trim();
+    const token = document.getElementById('supToken').value.trim();
+    const url = new URL(location.href);
+    url.searchParams.set('sup', supUrl);
+    url.searchParams.set('nodes', nodes);
+    if (token) url.searchParams.set('token', token);
+    await navigator.clipboard.writeText(url.toString());
+    log("Share link copied to clipboard", url.toString());
+  };
+
+  // ---------- Wire basics ----------
+  document.getElementById('saveNodes').onclick = () => {
+    saveNodes();
+    nodes.forEach((_,i)=>probeOne(i));
+  };
+  document.getElementById('probe').onclick = () => {
+    nodes.forEach((_,i)=>probeOne(i));
+    updateLeaderHint();
+  };
+
+  autoProbeCb.onchange = () => {
+    if (autoProbeCb.checked){
+      if (probeTimer) clearInterval(probeTimer);
+      probeTimer = setInterval(()=> nodes.forEach((_,i)=>probeOne(i)), 2000);
+    } else {
+      if (probeTimer) clearInterval(probeTimer);
+      probeTimer = null;
+    }
+  };
+
+  // init
+  saveNodes();
+</script>
+</body>
+</html>
