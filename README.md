@@ -8,3 +8,4 @@
 3. Toggle **Block repl** on one follower → writes still succeed (W=2/3).
 4. Toggle both followers **Down** → write fails with 503 (no quorum).
 5. **Restart** a node → state recovers (WAL replay).
+# DistributedKVStore
