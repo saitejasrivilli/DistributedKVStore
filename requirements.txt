@@ -4,3 +4,4 @@ httpx
 pydantic
 pytest
 pytest-asyncio
+prometheus-client

@@ -2,11 +2,14 @@
 import asyncio
 import os
 import time
+import uuid
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Histogram, generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response as StarletteResponse
 from pydantic import BaseModel
 
 from .config import settings
@@ -24,6 +27,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Prometheus latency histogram ---
+# try/except handles importlib.reload() in tests re-registering the same metric
+try:
+    REQUEST_LATENCY = Histogram(
+        "kvstore_request_duration_ms",
+        "Per-request latency in milliseconds",
+        ["method", "path"],
+        buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000],
+    )
+except ValueError:
+    from prometheus_client import REGISTRY as _REG
+    REQUEST_LATENCY = _REG._names_to_collectors["kvstore_request_duration_ms"]
 
 # --- State & singletons ---
 store = SQLiteStore(settings.DB_PATH)
@@ -48,6 +64,16 @@ class AdminToggle(BaseModel):
     block_repl: Optional[bool] = None
 
 
+# --- Middleware: request ID ---
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 # --- Middleware: latency histogram ---
 @app.middleware("http")
 async def record_latency(request: Request, call_next):
@@ -58,6 +84,7 @@ async def record_latency(request: Request, call_next):
     finally:
         ms = (time.time() - t0) * 1000.0
         metrics["latencies_ms"].append(ms)
+        REQUEST_LATENCY.labels(method=request.method, path=request.url.path).observe(ms)
 
 
 # --- Startup: build hash ring, replay WAL, start optional exporter ---
@@ -72,6 +99,13 @@ async def boot():
         elif rec.get("op") == "del":
             store.delete(rec["k"])
     start_exporter_if_enabled()
+
+
+# --- Shutdown: drain in-flight replication ---
+@app.on_event("shutdown")
+async def shutdown():
+    # Yield the event loop so any in-flight httpx replication calls can finish
+    await asyncio.sleep(0.1)
 
 
 def _is_owner(key: str) -> bool:
@@ -95,24 +129,20 @@ def _wal_size() -> int:
     return count
 
 
-def _quorum_available() -> bool:
-    """True if at least QUORUM_W - 1 peers are reachable (including self = 1)."""
+async def _quorum_available() -> bool:
+    """Concurrent async probe — all peers checked in parallel, 1 s timeout each."""
     if not settings.PEERS:
         return True
-    # Use the cached node health from replication perspective.
-    # We check synchronously against the PEERS list — healthy if enough are up.
-    # For the /health endpoint we return a best-effort cached value.
     try:
-        import urllib.request
-        reachable = 1  # self
-        for peer in settings.PEERS:
-            try:
-                req = urllib.request.Request(f"{peer}/health", method="GET")
-                resp = urllib.request.urlopen(req, timeout=1)
-                if resp.status == 200:
-                    reachable += 1
-            except Exception:
-                pass
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            results = await asyncio.gather(
+                *[client.get(f"{peer}/health") for peer in settings.PEERS],
+                return_exceptions=True,
+            )
+        reachable = 1 + sum(
+            1 for r in results
+            if not isinstance(r, Exception) and getattr(r, "status_code", 0) == 200
+        )
         return reachable >= settings.QUORUM_W
     except Exception:
         return False
@@ -120,7 +150,7 @@ def _quorum_available() -> bool:
 
 # --- Health endpoint ---
 @app.get("/health")
-def health():
+async def health():
     """
     Returns node status suitable for supervisor health polling.
     Format: {"status": "healthy"|"down", "role": "leader"|"follower",
@@ -139,7 +169,7 @@ def health():
         "role": "leader" if settings.IS_LEADER else "follower",
         "wal_size": _wal_size(),
         "node_id": settings.NODE_ID,
-        "quorum_available": _quorum_available(),
+        "quorum_available": await _quorum_available(),
     }
 
 
@@ -176,6 +206,14 @@ def metrics_endpoint():
         "latency_samples": len(metrics["latencies_ms"]),
         "replication_ack_samples": len(metrics["replication_acks"]),
     }
+
+
+@app.get("/metrics/prometheus", include_in_schema=False)
+def prometheus_metrics():
+    return StarletteResponse(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
 
 
 # --- KV API ---
@@ -306,7 +344,12 @@ async def internal_replicate(rec: dict):
         return Response(status_code=400)
 
     if op == "put":
-        store.put(rec["k"], rec["v"].encode(), rec["ver"])
+        current = store.get(rec["k"])
+        incoming_ver = rec.get("ver", 0)
+        if current is not None and current["version"] >= incoming_ver:
+            # Stale or duplicate replication record — discard silently
+            return Response(status_code=409)
+        store.put(rec["k"], rec["v"].encode(), incoming_ver)
     else:
         store.delete(rec["k"])
 
