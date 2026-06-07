@@ -415,3 +415,87 @@ async def test_delete_removes_key():
 
     assert del_resp.status_code == 200
     assert get_resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# New feature tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_request_id_header_present():
+    """Every response must include a non-empty X-Request-ID UUID header."""
+    the_app, _ = _make_app(is_leader=True, peers=[], quorum_w=1)
+    async with AsyncClient(
+        transport=ASGITransport(app=the_app), base_url="http://test"
+    ) as client:
+        r1 = await client.get("/health")
+        r2 = await client.put("/kv/rid-key", json={"value": "x"})
+
+    assert "x-request-id" in r1.headers, "X-Request-ID missing from GET /health"
+    assert "x-request-id" in r2.headers, "X-Request-ID missing from PUT /kv"
+    # IDs must be distinct across requests
+    assert r1.headers["x-request-id"] != r2.headers["x-request-id"]
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_endpoint():
+    """/metrics/prometheus returns Prometheus text format with the latency histogram."""
+    the_app, _ = _make_app(is_leader=True, peers=[], quorum_w=1)
+    async with AsyncClient(
+        transport=ASGITransport(app=the_app), base_url="http://test"
+    ) as client:
+        # Generate at least one observation
+        await client.put("/kv/prom-key", json={"value": "v"})
+        resp = await client.get("/metrics/prometheus")
+
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    body = resp.text
+    assert "kvstore_request_duration_ms" in body, "Histogram missing from /metrics/prometheus"
+    assert "# TYPE kvstore_request_duration_ms histogram" in body
+
+
+@pytest.mark.asyncio
+async def test_replicate_rejects_stale_version():
+    """/internal/replicate must return 409 when incoming version <= current version."""
+    the_app, api_mod = _make_app(is_leader=False, peers=[], quorum_w=1)
+    # Pre-seed store at version 5
+    api_mod.store.put("mono-key", b"current", 5)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=the_app), base_url="http://test"
+    ) as client:
+        # Same version — reject
+        r_same = await client.post(
+            "/internal/replicate",
+            json={"op": "put", "k": "mono-key", "v": "stale", "ver": 5},
+        )
+        # Lower version — reject
+        r_older = await client.post(
+            "/internal/replicate",
+            json={"op": "put", "k": "mono-key", "v": "stale", "ver": 3},
+        )
+        # Higher version — accept
+        r_new = await client.post(
+            "/internal/replicate",
+            json={"op": "put", "k": "mono-key", "v": "updated", "ver": 6},
+        )
+
+    assert r_same.status_code == 409, "Same version should be rejected with 409"
+    assert r_older.status_code == 409, "Older version should be rejected with 409"
+    assert r_new.status_code == 200, "Newer version should be accepted"
+    stored = api_mod.store.get("mono-key")["value"]
+    assert (stored if isinstance(stored, str) else stored.decode()) == "updated"
+
+
+@pytest.mark.asyncio
+async def test_health_quorum_available_no_peers():
+    """With no peers configured, quorum_available must be True (single-node is always quorate)."""
+    the_app, _ = _make_app(is_leader=True, peers=[], quorum_w=1)
+    async with AsyncClient(
+        transport=ASGITransport(app=the_app), base_url="http://test"
+    ) as client:
+        resp = await client.get("/health")
+
+    assert resp.status_code == 200
+    assert resp.json()["quorum_available"] is True
