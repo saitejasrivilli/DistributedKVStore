@@ -50,8 +50,11 @@ A distributed key-value store built in Python and FastAPI demonstrating quorum w
 | **Leader/follower replication** | Leader fans out via `/internal/replicate`; followers 307-redirect writes to leader |
 | **WAL with fsync** | Every write is appended and fsynced before replication; replayed on node restart |
 | **Consistent hash routing** | 100-vnode SHA-1 ring; supervisor routes each key to its preferred node |
-| **Health checking** | Supervisor polls `/health` every 5 s; marks node unavailable after 3 consecutive failures; writes bypass unhealthy nodes |
+| **Health checking** | `/health` probes all peers concurrently via `asyncio.gather` (1 s timeout); node reports `quorum_available` so supervisors can make routing decisions |
 | **Strong/eventual reads** | `?consistency=strong` gathers R=2/3 quorum reads and requires agreement; `eventual` (default) reads from local node only |
+| **Version monotonicity** | `/internal/replicate` rejects stale or duplicate records (version ≤ current) with 409, preventing out-of-order replication from overwriting newer data |
+| **Prometheus metrics** | `GET /metrics/prometheus` exposes `kvstore_request_duration_ms` histogram (labeled by method + path) in Prometheus text format; scrape directly with Prometheus or Grafana |
+| **Request tracing** | Every response carries an `X-Request-ID` UUID header for distributed trace correlation |
 | **Node simulation** | Admin toggles for `down` and `block_repl` states to simulate partitions without killing processes |
 | **Optional CloudWatch metrics** | Set `ENABLE_CLOUDWATCH=1` to export request counts, latency P50/P95, and replication ack averages |
 
@@ -122,7 +125,10 @@ pytest tests/ -v
 | `GET` | `/admin/config` | — | Node configuration and simulation state |
 | `POST` | `/admin/toggle` | — | Toggle `down` or `block_repl` simulation flags |
 | `GET` | `/metrics` | — | Request counts, error counts, latency sample count |
-| `POST` | `/internal/replicate` | — | Leader-to-follower replication (internal use) |
+| `GET` | `/metrics/prometheus` | — | Prometheus text format — `kvstore_request_duration_ms` histogram |
+| `POST` | `/internal/replicate` | — | Leader-to-follower replication; rejects stale versions with 409 |
+
+All responses include an `X-Request-ID` header (UUID) for trace correlation.
 
 ### Supervisor API (port 9000)
 
