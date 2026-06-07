@@ -1,23 +1,26 @@
 # app/api.py
-from fastapi import FastAPI, HTTPException, Request, Response
+import asyncio
+import os
+import time
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
-import time
 
 from .config import settings
-from .storage import SQLiteStore
-from .wal import WAL
-from .replication import Replicator
 from .hashring import HashRing
 from .metrics import metrics, start_exporter_if_enabled
+from .replication import Replicator
+from .storage import SQLiteStore
+from .wal import WAL
 
-app = FastAPI()
+app = FastAPI(title="DistributedKVStore", version="2.0.0")
 
-# Allow browser frontend in dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # dev only; tighten for prod
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -30,19 +33,22 @@ ring: Optional[HashRing] = None
 
 # In-memory admin toggles (for frontend-driven testing)
 state = {
-    "down": False,        # if True => node rejects normal traffic
-    "block_repl": False,  # if True => reject /internal/replicate to simulate partition
+    "down": False,
+    "block_repl": False,
 }
+
 
 # --- Models ---
 class KVPut(BaseModel):
     value: str
 
+
 class AdminToggle(BaseModel):
     down: Optional[bool] = None
     block_repl: Optional[bool] = None
 
-# --- Middleware: latency histogram samples ---
+
+# --- Middleware: latency histogram ---
 @app.middleware("http")
 async def record_latency(request: Request, call_next):
     t0 = time.time()
@@ -52,6 +58,7 @@ async def record_latency(request: Request, call_next):
     finally:
         ms = (time.time() - t0) * 1000.0
         metrics["latencies_ms"].append(ms)
+
 
 # --- Startup: build hash ring, replay WAL, start optional exporter ---
 @app.on_event("startup")
@@ -66,58 +73,77 @@ async def boot():
             store.delete(rec["k"])
     start_exporter_if_enabled()
 
+
 def _is_owner(key: str) -> bool:
     owners = ring.owners(key, settings.REPLICATION_FACTOR) if ring else []
     me = f"http://localhost:{settings.HTTP_PORT}"
     return me in owners
 
-# --- Health & Metrics ---
+
+def _wal_size() -> int:
+    wal_path = wal.path
+    if not os.path.exists(wal_path):
+        return 0
+    count = 0
+    try:
+        with open(wal_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+    except OSError:
+        pass
+    return count
+
+
+def _quorum_available() -> bool:
+    """True if at least QUORUM_W - 1 peers are reachable (including self = 1)."""
+    if not settings.PEERS:
+        return True
+    # Use the cached node health from replication perspective.
+    # We check synchronously against the PEERS list — healthy if enough are up.
+    # For the /health endpoint we return a best-effort cached value.
+    try:
+        import urllib.request
+        reachable = 1  # self
+        for peer in settings.PEERS:
+            try:
+                req = urllib.request.Request(f"{peer}/health", method="GET")
+                resp = urllib.request.urlopen(req, timeout=1)
+                if resp.status == 200:
+                    reachable += 1
+            except Exception:
+                pass
+        return reachable >= settings.QUORUM_W
+    except Exception:
+        return False
+
+
+# --- Health endpoint ---
 @app.get("/health")
 def health():
-    return {"ok": not state["down"], "state": state}
-# --- Admin/diagnostics ---
-from pydantic import BaseModel
-from typing import Optional
-
-@app.get("/admin/config")
-def admin_config():
+    """
+    Returns node status suitable for supervisor health polling.
+    Format: {"status": "healthy"|"down", "role": "leader"|"follower",
+             "wal_size": int, "node_id": str, "quorum_available": bool}
+    """
+    if state["down"]:
+        raise HTTPException(status_code=503, detail={
+            "status": "down",
+            "role": "leader" if settings.IS_LEADER else "follower",
+            "wal_size": _wal_size(),
+            "node_id": settings.NODE_ID,
+            "quorum_available": False,
+        })
     return {
+        "status": "healthy",
+        "role": "leader" if settings.IS_LEADER else "follower",
+        "wal_size": _wal_size(),
         "node_id": settings.NODE_ID,
-        "is_leader": settings.IS_LEADER,     # <— frontend expects this exact key
-        "peers": settings.PEERS,
-        "state": state,                      # {down, block_repl, (delay_ms if you added it)}
+        "quorum_available": _quorum_available(),
     }
 
-class AdminToggle(BaseModel):
-    down: Optional[bool] = None
-    block_repl: Optional[bool] = None
-    # delay_ms: Optional[int] = None        # if you added latency simulation
 
-@app.post("/admin/toggle")
-def admin_toggle(t: AdminToggle):
-    if t.down is not None: state["down"] = bool(t.down)
-    if t.block_repl is not None: state["block_repl"] = bool(t.block_repl)
-    # if t.delay_ms is not None: state["delay_ms"] = max(0, int(t.delay_ms))
-    return {"ok": True, "state": state}
-
-@app.get("/metrics")
-def metrics_endpoint():
-    return {
-        "requests_total": metrics["requests_total"],
-        "errors_total": metrics["errors_total"],
-        "latency_samples": len(metrics["latencies_ms"]),
-        "replication_ack_samples": len(metrics["replication_acks"]),
-    }
-
-# --- Admin (frontend-controlled simulation) ---
-@app.post("/admin/toggle")
-def admin_toggle(t: AdminToggle):
-    if t.down is not None:
-        state["down"] = t.down
-    if t.block_repl is not None:
-        state["block_repl"] = t.block_repl
-    return {"state": state}
-
+# --- Admin / diagnostics ---
 @app.get("/admin/config")
 def admin_config():
     return {
@@ -132,16 +158,89 @@ def admin_config():
         "state": state,
     }
 
+
+@app.post("/admin/toggle")
+def admin_toggle(t: AdminToggle):
+    if t.down is not None:
+        state["down"] = bool(t.down)
+    if t.block_repl is not None:
+        state["block_repl"] = bool(t.block_repl)
+    return {"ok": True, "state": state}
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    return {
+        "requests_total": metrics["requests_total"],
+        "errors_total": metrics["errors_total"],
+        "latency_samples": len(metrics["latencies_ms"]),
+        "replication_ack_samples": len(metrics["replication_acks"]),
+    }
+
+
 # --- KV API ---
 @app.get("/kv/{key}")
-async def get_key(key: str):
+async def get_key(
+    key: str,
+    consistency: str = Query(default="eventual", pattern="^(strong|eventual)$"),
+):
     if state["down"]:
         raise HTTPException(503, "node is down (simulated)")
     metrics["requests_total"] += 1
-    row = store.get(key)
-    if not row:
-        raise HTTPException(404, "not found")
-    return {"value": row["value"], "version": row["version"]}
+
+    if consistency == "eventual":
+        # Read from local store only
+        row = store.get(key)
+        if not row:
+            raise HTTPException(404, "not found")
+        return {"value": row["value"], "version": row["version"], "consistency": "eventual"}
+
+    # strong: read from quorum (R = QUORUM_R out of total nodes)
+    # Gather reads from self + all peers, require QUORUM_R agreeing on same value
+    local = store.get(key)
+    responses = []
+    if local:
+        responses.append({"value": local["value"], "version": local["version"]})
+
+    if settings.PEERS:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            tasks = [
+                client.get(f"{peer}/kv/{key}?consistency=eventual")
+                for peer in settings.PEERS
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            if getattr(r, "status_code", 500) == 200:
+                data = r.json()
+                responses.append({"value": data.get("value"), "version": data.get("version")})
+            elif getattr(r, "status_code", 500) == 404:
+                responses.append({"value": None, "version": 0})
+
+    if not responses:
+        raise HTTPException(503, "quorum read failed: no responses")
+
+    # Determine quorum: group by (value, version), need QUORUM_R agreement
+    from collections import Counter
+    counts: Counter = Counter()
+    for resp in responses:
+        key_tuple = (resp.get("value"), resp.get("version", 0))
+        counts[key_tuple] += 1
+
+    best, best_count = counts.most_common(1)[0]
+    if best_count < settings.QUORUM_R:
+        metrics["errors_total"] += 1
+        raise HTTPException(
+            503,
+            f"quorum read failed: only {best_count}/{settings.QUORUM_R} nodes agree"
+        )
+
+    val, ver = best
+    if val is None:
+        raise HTTPException(404, "not found (quorum)")
+    return {"value": val, "version": ver, "consistency": "strong", "quorum_acks": best_count}
+
 
 @app.put("/kv/{key}")
 async def put_key(key: str, body: KVPut):
@@ -156,10 +255,8 @@ async def put_key(key: str, body: KVPut):
     new_ver = 1 if not current else current["version"] + 1
     rec = {"op": "put", "k": key, "v": body.value, "ver": new_ver}
 
-    # Write-ahead log before replication
     wal.append(rec)
 
-    # Replicate and wait for quorum
     acks = 1
     if settings.PEERS:
         acks = await repl.replicate_to_followers(rec)
@@ -168,9 +265,9 @@ async def put_key(key: str, body: KVPut):
         metrics["errors_total"] += 1
         raise HTTPException(503, f"quorum write failed: acks={acks}")
 
-    # Commit locally
     store.put(key, body.value.encode(), new_ver)
     return {"ok": True, "version": new_ver, "acks": acks}
+
 
 @app.delete("/kv/{key}")
 async def delete_key(key: str):
@@ -197,10 +294,10 @@ async def delete_key(key: str):
     store.delete(key)
     return {"ok": True, "acks": acks}
 
+
 # --- Internal replication endpoint (called by leader) ---
 @app.post("/internal/replicate")
 async def internal_replicate(rec: dict):
-    # Simulate partition or node down
     if state["down"] or state["block_repl"]:
         return Response(status_code=503)
 
@@ -213,6 +310,5 @@ async def internal_replicate(rec: dict):
     else:
         store.delete(rec["k"])
 
-    # Persist follower WAL so recovery replays too
     wal.append(rec)
     return {"ack": True}
