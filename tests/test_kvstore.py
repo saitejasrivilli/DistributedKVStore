@@ -55,6 +55,7 @@ def _make_app(
 
 # ---------------------------------------------------------------------------
 # 1. Write then read back — value and version must match what was written
+#    Edge case: value integrity and version=1 on fresh key
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -70,6 +71,7 @@ async def test_write_then_read_returns_correct_value():
 
 # ---------------------------------------------------------------------------
 # 2. Three successive writes — each overwrites the previous, version climbs
+#    Edge case: last write wins; version is monotonically increasing
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -85,6 +87,7 @@ async def test_successive_writes_latest_value_wins():
 
 # ---------------------------------------------------------------------------
 # 3. Write → delete → write — key is recreated with new value, readable
+#    Edge case: delete makes key absent mid-cycle; re-write succeeds
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -102,6 +105,7 @@ async def test_write_delete_write_cycle():
 
 # ---------------------------------------------------------------------------
 # 4. Quorum write failure — key must NOT be stored (failed write is invisible)
+#    Edge case: quorum_w=2 with no peers → acks=1 → 503; subsequent GET → 404
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -116,6 +120,7 @@ async def test_quorum_failure_does_not_store_key():
 
 # ---------------------------------------------------------------------------
 # 5. Node down — ALL write/read/delete endpoints reject, not just health
+#    Edge case: down flag causes 503 on PUT, GET, and DELETE simultaneously
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -134,6 +139,7 @@ async def test_down_node_rejects_all_operations():
 
 # ---------------------------------------------------------------------------
 # 6. Node recovers — after down=False, pre-existing data is still readable
+#    Edge case: data written before outage survives the down/recover cycle
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -151,6 +157,7 @@ async def test_node_recovers_and_data_persists():
 
 # ---------------------------------------------------------------------------
 # 7. WAL replay: multiple ops including a delete — final state is correct
+#    Edge case: overwrite + delete sequence replayed; later version wins, deleted key absent
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -195,6 +202,7 @@ async def test_wal_replay_multiple_ops_correct_final_state():
 
 # ---------------------------------------------------------------------------
 # 8. Follower does NOT store the write — 307 redirects, key stays absent
+#    Edge case: follower redirect is a no-op for the local store; GET → 404
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -209,6 +217,7 @@ async def test_follower_does_not_store_write():
 
 # ---------------------------------------------------------------------------
 # 9. Strong read below quorum — returns 503, not stale data
+#    Edge case: quorum_r=2 with no peers; local value must NOT leak in error response
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -223,6 +232,7 @@ async def test_strong_read_below_quorum_returns_503_not_data():
 
 # ---------------------------------------------------------------------------
 # 10. Stale replication does NOT overwrite newer data
+#     Edge case: ver≤current rejected (409); store value and version unchanged
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -241,6 +251,7 @@ async def test_stale_replication_does_not_corrupt_data():
 
 # ---------------------------------------------------------------------------
 # 11. Version monotonicity — fresh replication updates the stored value
+#     Edge case: ver>current accepted; GET reflects new value and version
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -258,6 +269,7 @@ async def test_fresh_replication_updates_value():
 
 # ---------------------------------------------------------------------------
 # 12. gRPC: WAL is appended on successful replicate (durability check)
+#     Edge case: gRPC put → WAL file contains the exact record (crash-safe)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -293,6 +305,7 @@ async def test_grpc_wal_appended_on_replicate():
 
 # ---------------------------------------------------------------------------
 # 13. gRPC: concurrent replication of distinct keys — all acked and readable
+#     Edge case: 10 parallel gRPC puts → all ack=True; all keys readable from store
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -333,6 +346,7 @@ async def test_grpc_concurrent_replication_all_acked():
 
 # ---------------------------------------------------------------------------
 # 14. gRPC: blocked node rejects replication, store unchanged
+#     Edge case: block_repl=True → ack=False; key must not appear in store
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -368,6 +382,7 @@ async def test_grpc_blocked_node_does_not_store():
 
 # ---------------------------------------------------------------------------
 # 15. Replicator degrades to leader-only ack when all peers unreachable
+#     Edge case: all peers on refused ports → acks=1 (leader only); no crash or hang
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
