@@ -13,6 +13,8 @@ class Settings:
     QUORUM_W = int(os.getenv("QUORUM_W", "2"))
     QUORUM_R = int(os.getenv("QUORUM_R", "2"))
     DB_PATH = os.getenv("DB_PATH", "data/kv.sqlite")
+    # gRPC port for internal replication; 0 = disabled (used in tests)
+    GRPC_PORT = int(os.getenv("GRPC_PORT", str(int(os.getenv("HTTP_PORT", "8080")) + 1000)))
     AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
     ENABLE_CLOUDWATCH = os.getenv("ENABLE_CLOUDWATCH", "0") == "1"
 

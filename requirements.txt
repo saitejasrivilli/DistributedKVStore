@@ -5,3 +5,5 @@ pydantic
 pytest
 pytest-asyncio
 prometheus-client
+grpcio
+grpcio-tools

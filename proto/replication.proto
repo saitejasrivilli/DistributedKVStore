@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package kvstore;
+
+service Replication {
+    rpc Replicate (ReplicateRequest) returns (ReplicateResponse);
+}
+
+message ReplicateRequest {
+    string op  = 1;   // "put" or "del"
+    string k   = 2;
+    string v   = 3;
+    int64  ver = 4;
+}
+
+message ReplicateResponse {
+    bool  ack    = 1;
+    int32 status = 2;  // 200 ok | 409 stale | 503 unavailable
+}

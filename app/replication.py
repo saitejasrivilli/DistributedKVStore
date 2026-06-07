@@ -1,9 +1,11 @@
-# app/replication.py
 import asyncio
 import random
 from typing import List, Dict, Any
+from urllib.parse import urlparse
 
-import httpx
+import grpc
+
+from app import replication_pb2, replication_pb2_grpc
 from .metrics import metrics
 
 MAX_RETRIES = 3
@@ -11,26 +13,52 @@ _BACKOFF_BASE = 0.05   # 50 ms
 _BACKOFF_CAP  = 0.5    # 500 ms cap
 
 
-async def _post_with_retry(
-    client: httpx.AsyncClient,
-    url: str,
+def _grpc_addr(peer_http_url: str) -> str:
+    """http://host:8081  →  host:9081  (gRPC port = HTTP port + 1000)"""
+    parsed = urlparse(peer_http_url)
+    return f"{parsed.hostname}:{parsed.port + 1000}"
+
+
+async def _grpc_replicate_once(
+    stub: replication_pb2_grpc.ReplicationStub,
     record: Dict[str, Any],
+    timeout: float,
+) -> int | None:
+    """Single gRPC Replicate call. Returns HTTP-equivalent status or None on error."""
+    try:
+        resp = await stub.Replicate(
+            replication_pb2.ReplicateRequest(
+                op=record["op"],
+                k=record["k"],
+                v=record.get("v", ""),
+                ver=record.get("ver", 0),
+            ),
+            timeout=timeout,
+        )
+        return resp.status
+    except Exception:
+        return None
+
+
+async def _grpc_replicate_with_retry(
+    addr: str,
+    record: Dict[str, Any],
+    timeout: float,
 ) -> int | None:
     """
-    POST to one peer with exponential backoff + full jitter.
-    Returns HTTP status code on any response, None after all retries exhausted.
-    Retries only on network/transport errors, not on 4xx/5xx peer responses.
+    gRPC unary Replicate call with exponential backoff + full jitter.
+    Channel is reused across attempts. Retries only on transport failures,
+    not on application-level responses (409, 503).
     """
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = await client.post(url, json=record)
-            return r.status_code
-        except Exception:
-            if attempt == MAX_RETRIES - 1:
-                return None
-            # full jitter: sleep in [0, base * 2^attempt] capped at _BACKOFF_CAP
-            cap = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
-            await asyncio.sleep(random.uniform(0, cap))
+    async with grpc.aio.insecure_channel(addr) as channel:
+        stub = replication_pb2_grpc.ReplicationStub(channel)
+        for attempt in range(MAX_RETRIES):
+            status = await _grpc_replicate_once(stub, record, timeout)
+            if status is not None:
+                return status          # got a real response — don't retry
+            if attempt < MAX_RETRIES - 1:
+                cap = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
+                await asyncio.sleep(random.uniform(0, cap))
     return None
 
 
@@ -44,21 +72,20 @@ class Replicator:
         timeout: float = 0.75,
     ) -> int:
         """
-        Fan out to all peers in parallel; each peer retried up to MAX_RETRIES
-        times with exponential backoff + full jitter on transport failures.
-        Leader always counts as 1 ack.
+        Fan out to all peers in parallel over gRPC (HTTP/2, binary Protobuf).
+        Each peer retried up to MAX_RETRIES times with exponential backoff +
+        full jitter on transport failures. Leader always counts as 1 ack.
         """
         if not self.peers:
             return 1
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            results = await asyncio.gather(
-                *[
-                    _post_with_retry(client, f"{peer}/internal/replicate", record)
-                    for peer in self.peers
-                ],
-                return_exceptions=True,
-            )
+        results = await asyncio.gather(
+            *[
+                _grpc_replicate_with_retry(_grpc_addr(peer), record, timeout)
+                for peer in self.peers
+            ],
+            return_exceptions=True,
+        )
 
         acks = 1  # leader counts itself
         for status in results:

@@ -5,6 +5,8 @@ import time
 import uuid
 from typing import Optional
 
+import grpc
+import grpc.aio
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +15,10 @@ from starlette.responses import Response as StarletteResponse
 from pydantic import BaseModel
 
 from .config import settings
+from .grpc_server import ReplicationServicer
 from .hashring import HashRing
 from .metrics import metrics, start_exporter_if_enabled
+from app import replication_pb2_grpc
 from .replication import Replicator
 from .storage import SQLiteStore
 from .wal import WAL
@@ -46,6 +50,7 @@ store = SQLiteStore(settings.DB_PATH)
 wal = WAL()
 repl = Replicator(settings.PEERS)
 ring: Optional[HashRing] = None
+_grpc_server: Optional[grpc.aio.Server] = None
 
 # In-memory admin toggles (for frontend-driven testing)
 state = {
@@ -87,10 +92,10 @@ async def record_latency(request: Request, call_next):
         REQUEST_LATENCY.labels(method=request.method, path=request.url.path).observe(ms)
 
 
-# --- Startup: build hash ring, replay WAL, start optional exporter ---
+# --- Startup: build hash ring, replay WAL, start gRPC + optional exporter ---
 @app.on_event("startup")
 async def boot():
-    global ring
+    global ring, _grpc_server
     me = f"http://localhost:{settings.HTTP_PORT}"
     ring = HashRing([me] + settings.PEERS)
     for rec in wal.replay():
@@ -99,12 +104,21 @@ async def boot():
         elif rec.get("op") == "del":
             store.delete(rec["k"])
     start_exporter_if_enabled()
+    # Start gRPC replication server (GRPC_PORT=0 disables — used in tests)
+    if settings.GRPC_PORT:
+        _grpc_server = grpc.aio.server()
+        replication_pb2_grpc.add_ReplicationServicer_to_server(
+            ReplicationServicer(store, wal, state), _grpc_server
+        )
+        _grpc_server.add_insecure_port(f"[::]:{settings.GRPC_PORT}")
+        await _grpc_server.start()
 
 
-# --- Shutdown: drain in-flight replication ---
+# --- Shutdown: stop gRPC server, drain in-flight replication ---
 @app.on_event("shutdown")
 async def shutdown():
-    # Yield the event loop so any in-flight httpx replication calls can finish
+    if _grpc_server:
+        await _grpc_server.stop(grace=1.0)
     await asyncio.sleep(0.1)
 
 
