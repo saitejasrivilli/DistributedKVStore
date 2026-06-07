@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: Run pytest suite
+  test-python:
+    name: Python integration tests
     runs-on: ubuntu-latest
 
     steps:
@@ -31,3 +31,25 @@ jobs:
         run: pytest tests/ -v --tb=short
         env:
           PYTHONPATH: ${{ github.workspace }}
+
+  test-go-client:
+    name: Go client build + tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: client/go/go.mod
+
+      - name: Build kvctl CLI
+        working-directory: client/go
+        run: go build ./cmd/kvctl/...
+
+      - name: Run Go client tests
+        working-directory: client/go
+        run: go test ./kvstore/... -v -race
