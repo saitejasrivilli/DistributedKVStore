@@ -334,3 +334,32 @@ async def test_health_quorum_available_no_peers():
         resp = await c.get("/health")
     assert resp.status_code == 200
     assert resp.json()["quorum_available"] is True
+
+
+# ---------------------------------------------------------------------------
+# 15. Replicator: exponential backoff + jitter on peer failure
+#     Uses a refused port so ECONNREFUSED is immediate; verifies:
+#     - graceful degradation (leader-only ack returned)
+#     - backoff delay occurred (total time > first sleep floor)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_replicator_retries_with_backoff():
+    import time
+    from app.replication import Replicator, MAX_RETRIES, _BACKOFF_BASE
+
+    repl = Replicator(["http://127.0.0.1:19991"])  # nothing listening — ECONNREFUSED
+    t0 = time.monotonic()
+    acks = await repl.replicate_to_followers(
+        {"op": "put", "k": "retry-key", "v": "v", "ver": 1},
+        timeout=0.1,  # short timeout so test stays fast
+    )
+    elapsed = time.monotonic() - t0
+
+    assert acks == 1, "Leader-only ack expected when all peers unreachable"
+    # MAX_RETRIES-1 sleeps happened; minimum total sleep > 0 (full jitter lower-bound
+    # approaches 0 but connection + scheduling adds real time)
+    # Conservative check: whole round-trip with retries takes at least 50ms
+    assert elapsed >= MAX_RETRIES * _BACKOFF_BASE * 0.5, (
+        f"Expected backoff delay, completed in {elapsed:.3f}s"
+    )
